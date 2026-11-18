@@ -62,6 +62,18 @@
     {
       "workflow_id": "statistics",
       "command": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "workflow_id": "row-lock",
+      "command": "python3 examples/walkthrough.py --workflow row-lock"
+    },
+    {
+      "workflow_id": "lock-order",
+      "command": "python3 examples/walkthrough.py --workflow lock-order"
+    },
+    {
+      "workflow_id": "lock-recovery",
+      "command": "python3 examples/walkthrough.py --workflow lock-recovery"
     }
   ]
 }

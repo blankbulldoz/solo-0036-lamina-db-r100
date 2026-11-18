@@ -368,6 +368,67 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "row-lock",
+      "name": "bounded row qualification and wait",
+      "entry": "POST /transactions/{tx}/locks",
+      "steps": [
+        "transport",
+        "engine",
+        "catalog",
+        "versions",
+        "journal"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "catalog",
+        "versions",
+        "journal"
+      ],
+      "success": "a lease-backed holder edits a row while contenders queue on the same key; unrelated rows commit",
+      "failure": "unlocked writes are refused; a lock over a stale snapshot is a conflict, never a silent accept",
+      "verification": "python3 examples/walkthrough.py --workflow row-lock"
+    },
+    {
+      "id": "lock-order",
+      "name": "ordered acquisition and deadlock refusal",
+      "entry": "POST /transactions/{tx}/locks or /locks/batch",
+      "steps": [
+        "transport",
+        "engine",
+        "catalog"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "catalog"
+      ],
+      "success": "batch acquisition in canonical order holds every requested key or none",
+      "failure": "opposite scalar order forms a cycle and is refused with deadlock; a failed batch releases fresh keys",
+      "verification": "python3 examples/walkthrough.py --workflow lock-order"
+    },
+    {
+      "id": "lock-recovery",
+      "name": "lease expiry, cancellation and restart",
+      "entry": "POST /locks/cancel; laminad startup",
+      "steps": [
+        "transport",
+        "engine",
+        "journal",
+        "snapshot"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal",
+        "snapshot",
+        "catalog"
+      ],
+      "success": "expired and canceled waits are distinct from conflicts and committed data survives restart",
+      "failure": "restart restores no occupancy; process counters reset while rows and horizon replay",
+      "verification": "python3 examples/walkthrough.py --workflow lock-recovery"
     }
   ],
   "complexity": {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','row-lock','lock-order','lock-recovery']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -37,6 +37,14 @@ class Session:
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
+ def lock(self,tx,n,wait_ms=None,lease_ms=None,status=200,relation='spectra'):
+  body={'relation':relation,'key':n}
+  if wait_ms is not None:body['wait_ms']=wait_ms
+  if lease_ms is not None:body['lease_ms']=lease_ms
+  return self.call('POST',f'/transactions/{tx}/locks',body,status)
+ def release(self,tx,n,status=200):
+  return self.call('POST',f'/transactions/{tx}/locks/release',{'relation':'spectra','key':n},status)
+ def locks(self):return self.call('GET','/locks')
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
  if not condition:raise RuntimeError(message)
@@ -152,6 +160,98 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='row-lock':
+    holder=s.begin();waiter=s.begin();observer=s.begin()
+    holder_lock=s.lock(holder,1,lease_ms=5000)
+    require(holder_lock['transaction']==holder and not holder_lock['renewed'],'lock not described')
+    s.put(waiter,tuple_(1,amplitude=777),409)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+     queued=pool.submit(s.lock,waiter,1,8000,5000)
+     time.sleep(.25)
+     observed={'waiting':s.locks()['waiting'],'held':s.locks()['held']}
+     require(len(observed['waiting'])==1 and observed['waiting'][0]['transaction']==waiter,'wait not observable')
+     time.sleep(.2)
+     observer_lock=s.lock(observer,2,0)
+     s.put(observer,tuple_(2,amplitude=222));s.commit(observer)
+     require(queued.done() is False,'wait did not block while lock held')
+     s.release(holder,1)
+     granted=queued.result()
+    require(granted['waited_ms']>=300 and granted['transaction']==waiter,'wait did not report elapsed time')
+    s.put(waiter,tuple_(1,amplitude=777));committed=s.commit(waiter)
+    require(s.query(where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==777,'locked writer did not commit')
+    require(s.query(where=[{'column':'sample','op':'=','value':2}])['rows'][0]['amplitude']==222,'unrelated row was blocked')
+    bypass=s.begin();stale=s.begin()
+    s.lock(holder,3,lease_ms=5000)
+    s.call('POST',f'/transactions/{bypass}/put',{'relation':'spectra','row':tuple_(3,amplitude=333)},409)
+    s.put(holder,tuple_(3,amplitude=303));s.commit(holder)
+    stale_outcome=s.lock(bypass,3,0,5000,409)['error']['code']
+    require(stale_outcome=='conflict','stale lock outcome not distinct')
+    s.put(bypass,tuple_(3,amplitude=334));stale_commit=s.call('POST',f'/transactions/{bypass}/commit',{},409)['error']['code']
+    require(stale_commit=='conflict','stale commit accepted new value')
+    early=s.begin();s.put(early,tuple_(6,amplitude=616))
+    late_holder=s.begin();s.lock(late_holder,6,lease_ms=5000)
+    late_commit=s.call('POST',f'/transactions/{early}/commit',{},409)['error']['code']
+    require(late_commit=='locked','staged write bypassed a lock held at commit')
+    s.release(late_holder,6);s.call('POST',f'/transactions/{late_holder}/rollback')
+    s.call('POST',f'/transactions/{early}/commit',{},404)
+    retry=s.begin();s.put(retry,tuple_(6,amplitude=616));s.commit(retry)
+    require(s.query(where=[{'column':'sample','op':'=','value':6}])['rows'][0]['amplitude']==616,'released lock did not let staged commit through')
+    s.call('POST',f'/transactions/{bypass}/rollback',{},404);s.call('POST',f'/transactions/{stale}/rollback')
+    require(s.query(where=[{'column':'sample','op':'=','value':3}])['rows'][0]['amplitude']==303,'bypassing writer not published')
+    require(not s.locks()['held'],'locks leaked after commit')
+    observations={'granted':granted,'during_wait':observed,'other_row':observer_lock,'commit':committed,'bypass_refused':True,'stale_lock_refused':True,'final':s.locks()}
+   elif name=='lock-order':
+    a=s.begin();b=s.begin()
+    s.lock(a,3,lease_ms=5000);s.lock(b,4,lease_ms=5000)
+    started=time.monotonic()
+    immediate=s.lock(a,4,0,5000,409);immediate_ms=int((time.monotonic()-started)*1000)
+    started=time.monotonic()
+    bounded=s.lock(a,4,250,5000,409);bounded_ms=int((time.monotonic()-started)*1000)
+    require(immediate['error']['code']=='locked' and bounded['error']['code']=='locked','immediate refusal not distinct')
+    require(immediate_ms<150 and bounded_ms>=240,'bounded wait did not honor wait_ms')
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+     first=pool.submit(s.lock,a,4,1500,5000)
+     second=pool.submit(s.lock,b,3,1500,5000)
+     outcomes=[]
+     for job in (first,second):
+      try:outcomes.append({'lock':job.result()})
+      except RuntimeError as e:
+       require('deadlock' in str(e) or 'got 409' in str(e),'unexpected deadlock failure');outcomes.append({'refused':True})
+    require(any('refused' in o for o in outcomes),'contradictory order was not refused')
+    s.call('POST',f'/transactions/{a}/rollback');s.call('POST',f'/transactions/{b}/rollback')
+    ordered_a=s.begin();ordered_b=s.begin()
+    batch=s.call('POST',f'/transactions/{ordered_a}/locks/batch',{'rows':[{'relation':'spectra','key':5},{'relation':'spectra','key':6}],'lease_ms':5000})
+    batch2=s.call('POST',f'/transactions/{ordered_b}/locks/batch',{'rows':[{'relation':'spectra','key':6},{'relation':'spectra','key':5}],'lease_ms':5000},409)
+    s.put(ordered_a,tuple_(5,amplitude=505));s.put(ordered_a,tuple_(6,amplitude=606));s.commit(ordered_a)
+    s.call('POST',f'/transactions/{ordered_b}/rollback');require(not s.locks()['held'],'batch failure leaked qualifier')
+    observations={'immediate_ms':immediate_ms,'bounded_ms':bounded_ms,'refused':outcomes,'batch':batch,'batch_conflict':batch2}
+   elif name=='lock-recovery':
+    holder=s.begin();waiter=s.begin()
+    s.lock(holder,1,lease_ms=300)
+    expired={}
+    time.sleep(.45)
+    expired['occupancy']=s.locks();require(not expired['occupancy']['held'],'expired lease still counted as held')
+    expired['write']=s.put(waiter,tuple_(1,amplitude=123));expired['commit']=s.commit(waiter)
+    s.call('POST',f'/transactions/{holder}/rollback')
+    stale=s.begin();stale_lock=s.lock(stale,1,lease_ms=200);time.sleep(.3)
+    try:s.put(stale,tuple_(1,amplitude=999),409);expired['stale_write']='refused'
+    except RuntimeError:raise
+    canceled=s.begin();cancel_holder=s.begin();s.lock(cancel_holder,2,lease_ms=5000)
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+     pending=pool.submit(s.lock,canceled,2,8000,5000);time.sleep(.2)
+     s.call('POST',f'/transactions/{canceled}/locks/cancel',{})
+     try:pending.result()
+     except RuntimeError as e:require('canceled' in str(e),'cancel outcome not distinct')
+    s.release(cancel_holder,2);s.call('POST',f'/transactions/{canceled}/rollback');s.call('POST',f'/transactions/{cancel_holder}/rollback')
+    s.call('POST',f'/transactions/{stale}/rollback')
+    garbage=s.begin();s.lock(garbage,5,lease_ms=5000);s.call('POST',f'/transactions/{garbage}/rollback')
+    reclaimed=s.call('POST','/vacuum',{'horizon':s.stats()['sequence']})
+    before_restart=s.query()['rows'];s.stop();s.start()
+    after=s.stats();require(after['row_locks_held']==0 and not s.locks()['held'],'restart restored stale occupancy')
+    require(s.query()['rows']==before_restart,'restart changed committed rows')
+    restarted=s.begin();s.lock(restarted,1,lease_ms=5000);s.put(restarted,tuple_(1,amplitude=321));s.commit(restarted)
+    require(s.query()['rows'][0]['amplitude']==321 and not s.locks()['held'],'post-restart data mismatch')
+    observations={'expired':expired,'vacuum':reclaimed,'restart':{'sequence':after['sequence'],'held':after['row_locks_held'],'counters_reset':after['lock_counters']['acquired_since_open']==0},'after_restart_write':s.query(where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

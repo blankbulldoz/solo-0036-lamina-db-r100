@@ -62,7 +62,7 @@ func respondError(w http.ResponseWriter, err error) {
 			status = 400
 		case "not_found":
 			status = 404
-		case "conflict":
+		case "conflict", "locked", "deadlock", "lock_expired", "canceled":
 			status = 409
 		case "snapshot":
 			status = 410
@@ -90,6 +90,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/delete", s.deleteRow)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/commit", s.commit)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/rollback", s.rollback)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/locks", s.acquireLock)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/locks/batch", s.acquireLocks)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/locks/release", s.releaseLock)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/locks/release_all", s.releaseLocks)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/locks/cancel", s.cancelLockWait)
+	s.mux.HandleFunc("GET "+p+"/locks", s.locks)
 	s.mux.HandleFunc("POST "+p+"/get", s.get)
 	s.mux.HandleFunc("POST "+p+"/query", s.query)
 	s.mux.HandleFunc("POST "+p+"/sql", s.sql)

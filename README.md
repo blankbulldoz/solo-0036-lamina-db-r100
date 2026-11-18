@@ -19,7 +19,7 @@ go build -o bin/laminad ./cmd/laminad
 python3 examples/walkthrough.py --workflow all
 ```
 
-该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
+该命令启动临时实例，执行 17 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
 
 ## 一个事务
 
@@ -51,6 +51,33 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 读事务固定开始时的提交序号，重复读稳定，支持读自己的暂存写入。普通读使用当前序号。按 `at` 查询只接受保留区间内的序号，并要求关系在该序号已存在。事务无法访问在它开始之后创建的关系。无显式排序时按类型化主键排序；排序相同时也用主键确定次序。升序 null 在前，降序 null 在后。null 普通比较不匹配；使用 `is_null` 检查。
 
 数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
+
+## 行级排他锁
+
+`POST /transactions/<id>/locks` 让调用方在执行昂贵编辑前先取得指定行的修改资格。正文为 `{"relation":"spectra","key":1,"wait_ms":500,"lease_ms":30000}`：
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/locks -H 'Content-Type: application/json' \
+  -d '{"relation":"spectra","key":1,"wait_ms":500,"lease_ms":30000}'
+```
+
+成功返回 `id`、`relation`、`key`、`transaction`、`lease_ms`、`acquired_at`、`expires_at`，以及本次是否只是续约（`renewed`）和实际等待时长 `waited_ms`。同一事务再次请求同一行是续约；已持有该行的其他事务得到 409 `locked` 并携带当前持有者，`wait_ms>0` 时先排队等待，而不是把整段编辑算完才在提交时发现冲突。
+
+锁是按键的排他修改资格，不是范围或谓词锁，不改变默认快照隔离：它不阻止其他事务读取该行，也不使本事务的读变成串行化。多行编辑请用 `POST /transactions/<id>/locks/batch`，正文 `{"rows":[{"relation":"spectra","key":1},{"relation":"spectra","key":2}],"wait_ms":1000,"lease_ms":30000}`。批量请求按 (relation, key) 规范化顺序一次性获取，全部成功才保留；任一键失败会释放本次新取得的前序键并返回错误，因此相反获取顺序不会互相占住对方需要的行。
+
+边界与解除：
+
+- `wait_ms` 取值 0..10000，0 表示不排队立即拒绝；超时返回 409 `locked`，等待时间有上限。
+- `lease_ms` 取值 100..600000，默认 60000。租约到期后锁自动消失并计入 `expired_since_open`；后续使用该资格会得到 409 `lock_expired`，不会静默接受过期快照。
+- 等待期检测环形依赖，形成环的等待以 409 `deadlock` 立即拒绝，未成环的等待继续受 `wait_ms` 约束。
+- `POST /transactions/<id>/locks/cancel` 只取消用户本事务正在进行的等待，返回 409 `canceled`，与超时、死锁和租约到期区分。
+- `POST /transactions/<id>/locks/release` 用 `{"relation":"spectra","key":1}` 释放单行，`POST /transactions/<id>/locks/release_all` 释放全部；重复释放无副作用。显式释放后，之后的提交就是普通快照隔离提交。
+- 提交、回滚和实例关闭都会释放该事务的全部行锁。锁只存在于进程内，不写日志、不进入备份；重启后占用状态清零，需要重新取得资格。这正是重启、回收和带着锁提交要分别核对的理由。
+- 未使用新接口的写入同样受约束：`put`/`delete`/`commit` 在目标行被其他活跃事务持锁时返回 409 `locked`。若事务自己持有该行的锁但租约已过期或该行在事务快照之后已被提交，则返回 409 `lock_expired` 或 409 `conflict`，绝不把基于旧快照的值当作新值发布。
+- 只有持锁的写入会额外检查“取得锁之后该行未被改动”。无锁写入维持原有的提交期同键检查。
+- 每个事务最多 1000 个行锁，进程最多 4096 个持有中的锁；超限返回 429 `capacity`。
+
+`GET /locks` 返回当前真实持有（`held`）与等待（`waiting`）中的占用，以及 `acquired/renewed/released/expired/waited/timed_out/canceled/aborted_waits/deadlocks` 计数。`GET /stats` 另有 `row_locks_held`、`row_lock_waits` 与同样的 `lock_counters`；这些进程事实在重启后归零。锁不保证写偏差防护，也不把同键排他升级为范围串行化。
 
 SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
 
@@ -91,7 +118,7 @@ curl -s http://127.0.0.1:7386/v1/lamina/backup -o /tmp/lamina-backup.lmi
 
 请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
 
-错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
+错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突、唯一冲突、锁占用 `locked`、等待环 `deadlock`、租约过期 `lock_expired` 和用户取消 `canceled` 均为 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
 
 ## 容器
 

@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"lamina/internal/datum"
 	"lamina/internal/journal"
 	"lamina/internal/versions"
@@ -20,6 +21,7 @@ type Transaction struct {
 	ReadOnly bool   `json:"read_only"`
 	Started  string `json:"started"`
 	writes   map[string]map[string]staged
+	locks    map[string]txnLock
 }
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
@@ -39,7 +41,7 @@ func (d *DB) Begin(readOnly bool) (Transaction, error) {
 	if _, err := rand.Read(id[:]); err != nil {
 		return Transaction{}, err
 	}
-	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}}
+	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}, locks: map[string]txnLock{}}
 	d.transactions[tx.ID] = tx
 	out := *tx
 	out.writes = nil
@@ -77,6 +79,9 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 		return invalid(err)
 	}
 	key := r.Key(normalized)
+	if err = d.checkRowWriteAllowed(tx, table, key); err != nil {
+		return err
+	}
 	rows := d.store.Scan(table, tx.Snapshot)
 	overlay(rows, tx.writes, table)
 	if insertOnly {
@@ -131,6 +136,9 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 		return fault("invalid", "invalid primary value")
 	}
 	key := value.Key()
+	if err = d.checkRowWriteAllowed(tx, table, key); err != nil {
+		return err
+	}
 	if tx.writes[table] == nil {
 		tx.writes[table] = map[string]staged{}
 	}
@@ -150,6 +158,7 @@ func (d *DB) Rollback(id string) error {
 		return err
 	}
 	delete(d.transactions, id)
+	d.locks.releaseAll(id)
 	return nil
 }
 func (d *DB) Commit(id string) (Commit, error) {
@@ -163,6 +172,14 @@ func (d *DB) Commit(id string) (Commit, error) {
 		return Commit{}, err
 	}
 	defer delete(d.transactions, id)
+	defer d.locks.releaseAll(id)
+	if err = d.checkLocksAtCommit(tx); err != nil {
+		var domain *Error
+		if errors.As(err, &domain) && domain.Code == "conflict" {
+			d.conflicts++
+		}
+		return Commit{}, err
+	}
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {
